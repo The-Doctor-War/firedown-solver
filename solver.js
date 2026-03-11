@@ -213,13 +213,16 @@ function preprocessPlayer(data, solvedCache) {
             funcName: solvedCache.funcName,
             testParams: [[solvedCache.r, solvedCache.p]],
         };
+        console.log("[Solver] Using cached params: " + solvedCache.funcName + "(" + solvedCache.r + "," + solvedCache.p + ",n)");
     }
 
     // --- Full solve path ---
     if (!solvedParams) {
         var table = findStringTable(data);
         if (table) {
+            console.log("[Solver] Found table: " + table.tableVar + ", split@" + table.splitIdx);
             var candidates = findCandidates(data, table.tableVar, table.splitIdx);
+            console.log("[Solver] Found " + candidates.length + " candidates");
 
             // Build test params: candidate × base × r in [0..30]
             var testEntries = [];
@@ -237,10 +240,13 @@ function preprocessPlayer(data, solvedCache) {
                     }
                 }
             }
+            console.log("[Solver] " + testEntries.length + " param combos");
 
             if (candidates.length > 0) {
                 solvedParams = { candidates: candidates, testEntries: testEntries };
             }
+        } else {
+            console.log("[Solver] No string table found!");
         }
     }
 
