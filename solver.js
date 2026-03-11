@@ -328,13 +328,36 @@ function preprocessPlayer(data, solvedCache) {
         }
     }
 
-    // --- Inject probe at IIFE close ---
+    // --- Inject try-catch wrapper and probe at IIFE close ---
+    // The player.js may crash during execution (missing globals in sandbox).
+    // We need the _df captures to survive and the probe code to still run.
+    // Strategy: inject try{ after the last _df declaration, }catch(e){} before probe.
     var iifeCloseIdx = modified.lastIndexOf('}).call(this)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(_yt_player)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(');
 
     if (iifeCloseIdx !== -1) {
-        modified = modified.substring(0, iifeCloseIdx) + '\n' + probeBody + '\n' + modified.substring(iifeCloseIdx);
+        // Find where to insert try{ — right after the last _df injection
+        // (or after 'use strict'; if no injections)
+        var tryInsertIdx = modified.indexOf("'use strict';");
+        if (tryInsertIdx !== -1) tryInsertIdx += "'use strict';".length;
+        else tryInsertIdx = modified.indexOf('{') + 1; // after IIFE opening {
+
+        // Find the last _df declaration we injected
+        var lastDf = -1;
+        for (var di = 0; di < 20; di++) {
+            var dfPos = modified.indexOf('\nvar _df' + di + '=');
+            if (dfPos !== -1) {
+                var dfEnd = modified.indexOf(';', dfPos);
+                if (dfEnd > lastDf) lastDf = dfEnd + 1;
+            }
+        }
+        if (lastDf > tryInsertIdx) tryInsertIdx = lastDf;
+
+        modified = modified.substring(0, tryInsertIdx) + '\ntry{\n' +
+            modified.substring(tryInsertIdx, iifeCloseIdx) +
+            '\n}catch(_e){}\n' + probeBody + '\n' +
+            modified.substring(iifeCloseIdx);
         return SETUP_CODE + '\n' + modified;
     }
 
