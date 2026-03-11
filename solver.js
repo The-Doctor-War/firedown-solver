@@ -6,7 +6,7 @@
 // =============================================================================
 // SOLVER_VERSION is checked by the shell to know when to update.
 // Bump this number whenever this file is modified.
-var SOLVER_VERSION = 1;
+var SOLVER_VERSION = 2;
 
 // Browser environment shims so player.js can execute in a Function() sandbox
 var SETUP_CODE = [
