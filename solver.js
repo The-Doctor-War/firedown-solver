@@ -39,11 +39,14 @@ function findStringTable(data) {
         var delimiter = sc[2];
         var splitPos = sc.index;
         var before = data.substring(0, splitPos);
-        var varMatch = before.match(/var\s+(\w+)=(['"])[^]*$/);
-        if (!varMatch) continue;
-        var varName = varMatch[1];
-        var quote = varMatch[2];
-        var contentStart = before.lastIndexOf(varMatch[0]) + varMatch[0].length;
+        // Find the last var X=QUOTE before the .split call
+        var varMatches = before.matchAll(/var\s+(\w+)=(['"])/g);
+        var lastVar = null;
+        for (var vm of varMatches) lastVar = vm;
+        if (!lastVar) continue;
+        var varName = lastVar[1];
+        var quote = lastVar[2];
+        var contentStart = lastVar.index + lastVar[0].length;
         var content = data.substring(contentStart, splitPos);
         if (content.endsWith(quote)) content = content.slice(0, -1);
         content = content.replace(new RegExp('\\\\' + quote.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), quote);
