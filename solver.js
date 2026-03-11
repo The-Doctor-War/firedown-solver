@@ -91,7 +91,7 @@ function findStringTable(data) {
  */
 function findCandidates(data, tableVar, splitIdx) {
     var earlyChunk = data.substring(0, Math.min(data.length, 30000));
-    var funcDefs = earlyChunk.matchAll(/(?:var\s+)?(\w+)=function\((\w+(?:,\w+){2,})\)\{/g);
+    var funcDefs = earlyChunk.matchAll(/(?:^|[^a-zA-Z0-9_$])(?:var\s+)?(\w+)=function\((\w+(?:,\w+){2,})\)\{/g);
     var candidates = [];
 
     for (var fd of funcDefs) {
@@ -278,6 +278,10 @@ function preprocessPlayer(data, solvedCache) {
     var modified = data;
 
     if (solvedParams && solvedParams.candidates) {
+        // Inject _df assignments right after each candidate function's closing }
+        // Using comma expression to stay inside the var chain:
+        // var ...,funcName=function(){...},_dfN=funcName,...
+        // This captures the function IMMEDIATELY, before any runtime crash.
         var injections = [];
         for (var i = 0; i < solvedParams.candidates.length; i++) {
             var c = solvedParams.candidates[i];
@@ -285,34 +289,14 @@ function preprocessPlayer(data, solvedCache) {
             if (defIdx === -1) continue;
             var funcEnd = findFuncEnd(modified, defIdx);
             if (funcEnd === -1) continue;
-            var semiPos = findChainEnd(modified, funcEnd + 1);
-            if (semiPos !== -1) {
-                injections.push({ pos: semiPos + 1, code: '\nvar _df' + i + '=' + c.funcName + ';\n' });
-            }
+            // Inject right after the function's closing }
+            // The char after } is either , or ; (end of chain)
+            injections.push({ pos: funcEnd + 1, code: ',_df' + i + '=' + c.funcName });
         }
-        // Deduplicate: multiple functions in the same var chain produce the same semiPos
-        var seenPos = {};
-        var uniqueInjections = [];
+        // Sort descending to avoid offset shifts
+        injections.sort(function(a, b) { return b.pos - a.pos; });
         for (var j = 0; j < injections.length; j++) {
-            if (!seenPos[injections[j].pos]) {
-                seenPos[injections[j].pos] = true;
-                uniqueInjections.push(injections[j]);
-            }
-        }
-        // Merge injections at the same position
-        var mergedByPos = {};
-        for (var j = 0; j < injections.length; j++) {
-            var p = injections[j].pos;
-            if (!mergedByPos[p]) mergedByPos[p] = '';
-            mergedByPos[p] += injections[j].code;
-        }
-        var mergedInjections = [];
-        for (var p in mergedByPos) {
-            mergedInjections.push({ pos: parseInt(p), code: mergedByPos[p] });
-        }
-        mergedInjections.sort(function(a, b) { return b.pos - a.pos; });
-        for (var j = 0; j < mergedInjections.length; j++) {
-            var inj = mergedInjections[j];
+            var inj = injections[j];
             modified = modified.substring(0, inj.pos) + inj.code + modified.substring(inj.pos);
         }
     } else if (solvedParams) {
@@ -320,42 +304,45 @@ function preprocessPlayer(data, solvedCache) {
         if (defIdx !== -1) {
             var funcEnd = findFuncEnd(modified, defIdx);
             if (funcEnd !== -1) {
-                var semiPos = findChainEnd(modified, funcEnd + 1);
-                if (semiPos !== -1) {
-                    modified = modified.substring(0, semiPos + 1) + '\nvar _df0=' + solvedParams.funcName + ';\n' + modified.substring(semiPos + 1);
-                }
+                modified = modified.substring(0, funcEnd + 1) + ',_df0=' + solvedParams.funcName + modified.substring(funcEnd + 1);
             }
         }
     }
 
     // --- Inject try-catch wrapper and probe at IIFE close ---
     // The player.js may crash during execution (missing globals in sandbox).
-    // We need the _df captures to survive and the probe code to still run.
-    // Strategy: inject try{ after the last _df declaration, }catch(e){} before probe.
+    // Strategy:
+    // 1. Declare all _df vars right after 'use strict'; (before try)
+    // 2. Wrap entire IIFE body (including all var chains) in try-catch
+    // 3. Inside the try block, _df vars get assigned at their injection points
+    // 4. If player crashes, probe code after }catch{} still runs with whatever _df
+    //    vars were assigned before the crash
     var iifeCloseIdx = modified.lastIndexOf('}).call(this)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(_yt_player)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(');
 
     if (iifeCloseIdx !== -1) {
-        // Find where to insert try{ — right after the last _df injection
-        // (or after 'use strict'; if no injections)
-        var tryInsertIdx = modified.indexOf("'use strict';");
-        if (tryInsertIdx !== -1) tryInsertIdx += "'use strict';".length;
-        else tryInsertIdx = modified.indexOf('{') + 1; // after IIFE opening {
+        // Find 'use strict'; insertion point
+        var strictIdx = modified.indexOf("'use strict';");
+        var afterStrict = strictIdx !== -1 ? strictIdx + "'use strict';".length : modified.indexOf('{') + 1;
 
-        // Find the last _df declaration we injected
-        var lastDf = -1;
+        // Build _df declarations (var _df0,_df1,...; before try)
+        var dfCount = 0;
         for (var di = 0; di < 20; di++) {
-            var dfPos = modified.indexOf('\nvar _df' + di + '=');
-            if (dfPos !== -1) {
-                var dfEnd = modified.indexOf(';', dfPos);
-                if (dfEnd > lastDf) lastDf = dfEnd + 1;
-            }
+            if (modified.indexOf('\n_df' + di + '=') !== -1) dfCount = di + 1;
         }
-        if (lastDf > tryInsertIdx) tryInsertIdx = lastDf;
+        var dfDecl = '';
+        if (dfCount > 0) {
+            var dfNames = [];
+            for (var di = 0; di < dfCount; di++) dfNames.push('_df' + di);
+            dfDecl = '\nvar ' + dfNames.join(',') + ';\n';
+        }
 
-        modified = modified.substring(0, tryInsertIdx) + '\ntry{\n' +
-            modified.substring(tryInsertIdx, iifeCloseIdx) +
+        // Insert: declarations, then try{ after 'use strict';
+        // Then }catch(_e){} + probe before IIFE close
+        modified = modified.substring(0, afterStrict) +
+            dfDecl + 'try{\n' +
+            modified.substring(afterStrict, iifeCloseIdx) +
             '\n}catch(_e){}\n' + probeBody + '\n' +
             modified.substring(iifeCloseIdx);
         return SETUP_CODE + '\n' + modified;
