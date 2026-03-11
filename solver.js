@@ -138,6 +138,23 @@ function findFuncEnd(src, defIdx) {
 }
 
 /**
+ * From a position after a function's closing }, find the semicolon
+ * that ends the var chain at brace depth 0 (relative).
+ * This correctly skips over subsequent functions in the same var chain.
+ * Returns position of the ;, or -1.
+ */
+function findChainEnd(src, afterFuncEnd) {
+    var depth = 0, pos = afterFuncEnd;
+    while (pos < src.length) {
+        if (src[pos] === '{') depth++;
+        else if (src[pos] === '}') depth--;
+        else if (src[pos] === ';' && depth === 0) return pos;
+        pos++;
+    }
+    return -1;
+}
+
+/**
  * Build the probe code string that tests candidate functions.
  * When executed inside the player IIFE, this code probes each _dfN
  * variable with the given (r, p) params and sets _result.n on success.
@@ -274,14 +291,34 @@ function preprocessPlayer(data, solvedCache) {
             if (defIdx === -1) continue;
             var funcEnd = findFuncEnd(modified, defIdx);
             if (funcEnd === -1) continue;
-            var semiPos = modified.indexOf(';', funcEnd);
+            var semiPos = findChainEnd(modified, funcEnd + 1);
             if (semiPos !== -1) {
                 injections.push({ pos: semiPos + 1, code: '\nvar _df' + i + '=' + c.funcName + ';\n' });
             }
         }
-        injections.sort(function(a, b) { return b.pos - a.pos; });
+        // Deduplicate: multiple functions in the same var chain produce the same semiPos
+        var seenPos = {};
+        var uniqueInjections = [];
         for (var j = 0; j < injections.length; j++) {
-            var inj = injections[j];
+            if (!seenPos[injections[j].pos]) {
+                seenPos[injections[j].pos] = true;
+                uniqueInjections.push(injections[j]);
+            }
+        }
+        // Merge injections at the same position
+        var mergedByPos = {};
+        for (var j = 0; j < injections.length; j++) {
+            var p = injections[j].pos;
+            if (!mergedByPos[p]) mergedByPos[p] = '';
+            mergedByPos[p] += injections[j].code;
+        }
+        var mergedInjections = [];
+        for (var p in mergedByPos) {
+            mergedInjections.push({ pos: parseInt(p), code: mergedByPos[p] });
+        }
+        mergedInjections.sort(function(a, b) { return b.pos - a.pos; });
+        for (var j = 0; j < mergedInjections.length; j++) {
+            var inj = mergedInjections[j];
             modified = modified.substring(0, inj.pos) + inj.code + modified.substring(inj.pos);
         }
     } else if (solvedParams) {
@@ -289,7 +326,7 @@ function preprocessPlayer(data, solvedCache) {
         if (defIdx !== -1) {
             var funcEnd = findFuncEnd(modified, defIdx);
             if (funcEnd !== -1) {
-                var semiPos = modified.indexOf(';', funcEnd);
+                var semiPos = findChainEnd(modified, funcEnd + 1);
                 if (semiPos !== -1) {
                     modified = modified.substring(0, semiPos + 1) + '\nvar _df0=' + solvedParams.funcName + ';\n' + modified.substring(semiPos + 1);
                 }
