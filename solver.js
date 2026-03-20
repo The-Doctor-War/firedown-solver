@@ -209,17 +209,48 @@ function preprocessPlayer(data, solvedCache) {
     }
     if (!probeBody) probeBody = '/* no candidates found */';
 
-    // --- Inject _df assignments at chain boundaries ---
-    // These capture functions before they get overwritten later in execution.
-    // Used as fallback when direct-by-name fails (player ran to completion).
+    // --- Inject _df captures using multiple strategies ---
     var modified = data;
     if (candidates && candidates.length > 0) {
-        var injections = [];
+        // Strategy 1: Comma injection inside var chains (most reliable)
+        // Injects ,_dfN=funcName right after function's closing }
+        // Only safe when string table delimiter is NOT } (brace matching works)
+        var tableDelimiter = null;
+        var delimMatch = data.substring(0, 2000).match(/\.split\((['"])(.)(\1)\)/);
+        if (delimMatch) tableDelimiter = delimMatch[2];
+
+        if (tableDelimiter !== '}') {
+            var commaInjections = [];
+            for (var i = 0; i < candidates.length; i++) {
+                var c = candidates[i];
+                var defIdx = modified.indexOf(c.funcName + '=function(');
+                if (defIdx === -1) continue;
+                var bodyStart = modified.indexOf('{', defIdx);
+                if (bodyStart === -1) continue;
+                var depth = 0, pos = bodyStart;
+                while (pos < modified.length) {
+                    if (modified[pos] === '{') depth++;
+                    else if (modified[pos] === '}') { depth--; if (depth === 0) break; }
+                    pos++;
+                }
+                if (depth === 0) {
+                    commaInjections.push({ pos: pos + 1, code: ',_df' + i + '=' + c.funcName });
+                }
+            }
+            commaInjections.sort(function(a, b) { return b.pos - a.pos; });
+            for (var j = 0; j < commaInjections.length; j++) {
+                var inj = commaInjections[j];
+                modified = modified.substring(0, inj.pos) + inj.code + modified.substring(inj.pos);
+            }
+        }
+
+        // Strategy 2: Chain-boundary injection (fallback for } delimiter players)
+        // Injects _dfN=funcName; after ;\nfunction or ;\nvar boundaries
+        var chainInjections = [];
         for (var i = 0; i < candidates.length; i++) {
             var c = candidates[i];
             var defIdx = modified.indexOf(c.funcName + '=function(');
             if (defIdx === -1) continue;
-            // Find chain boundary: ;\n followed by function or var at line start
             var searchFrom = defIdx;
             var chainEnd = -1;
             while (searchFrom < modified.length) {
@@ -233,15 +264,14 @@ function preprocessPlayer(data, solvedCache) {
                 searchFrom = nextSemiNl + 2;
             }
             if (chainEnd !== -1) {
-                injections.push({ pos: chainEnd, code: '\ntry{_df' + i + '=' + c.funcName + ';}catch(e){}' });
+                chainInjections.push({ pos: chainEnd, code: '\ntry{_df' + i + '=' + c.funcName + ';}catch(e){}' });
             }
         }
-        // Merge and inject (descending order)
         var mergedByPos = {};
-        for (var j = 0; j < injections.length; j++) {
-            var p = injections[j].pos;
+        for (var j = 0; j < chainInjections.length; j++) {
+            var p = chainInjections[j].pos;
             if (!mergedByPos[p]) mergedByPos[p] = '';
-            mergedByPos[p] += injections[j].code;
+            mergedByPos[p] += chainInjections[j].code;
         }
         var sorted = Object.keys(mergedByPos).map(Number).sort(function(a, b) { return b - a; });
         for (var j = 0; j < sorted.length; j++) {
