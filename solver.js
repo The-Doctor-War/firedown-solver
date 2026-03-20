@@ -3,7 +3,7 @@
 // Hosted at: https://github.com/solarizeddev/firedown-solver
 // The background.js shell fetches, caches, and executes this module.
 // =============================================================================
-var SOLVER_VERSION = 4;
+var SOLVER_VERSION = 5;
 
 var SETUP_CODE = [
     'if(typeof globalThis.XMLHttpRequest==="undefined"){globalThis.XMLHttpRequest={prototype:{}};}',
@@ -64,11 +64,24 @@ function findCandidates(data, tableVar, splitIdx) {
         var funcName = fd[1];
         var defPos = data.indexOf(funcName + '=function(');
         if (defPos === -1) continue;
-        // Scan a generous window for XOR accesses (avoids brace matching)
-        var window = data.substring(defPos, Math.min(defPos + 5000, data.length));
+        // Isolate function body via brace matching to avoid picking up
+        // XOR accesses from neighboring functions
+        var bodyStart = data.indexOf('{', defPos);
+        var funcBody = null;
+        if (bodyStart !== -1) {
+            var depth = 0, pos = bodyStart;
+            while (pos < data.length) {
+                if (data[pos] === '{') depth++;
+                else if (data[pos] === '}') { depth--; if (depth === 0) { funcBody = data.substring(bodyStart, pos + 1); break; } }
+                pos++;
+            }
+        }
+        // If brace matching fails (e.g. } in string literals), fall back to a
+        // conservative 2000-char window from defPos
+        var searchText = funcBody || data.substring(defPos, Math.min(defPos + 2000, data.length));
         var xorRx = new RegExp(tableVar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\[\\w+\\^(\\d+)\\]', 'g');
         var bases = new Set(), xm;
-        while ((xm = xorRx.exec(window)) !== null) bases.add(parseInt(xm[1]) ^ splitIdx);
+        while ((xm = xorRx.exec(searchText)) !== null) bases.add(parseInt(xm[1]) ^ splitIdx);
         if (bases.size > 0) candidates.push({ funcName: funcName, bases: Array.from(bases) });
     }
     candidates.sort(function(a, b) { return b.bases.length - a.bases.length; });
