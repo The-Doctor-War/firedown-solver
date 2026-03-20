@@ -120,6 +120,36 @@ function buildProbe(candidates, testEntries) {
 }
 
 /**
+ * Build probe using _df captured vars (fallback when direct names are overwritten).
+ */
+function buildDfProbe(candidates, testEntries) {
+    var fnArr = candidates.map(function(_, i) { return '_df' + i; }).join(',');
+    var nameArr = candidates.map(function(c) { return '"' + c.funcName + '"'; }).join(',');
+    var paramArr = testEntries.map(function(e) { return '[' + e.fi + ',' + e.r + ',' + e.p + ']'; }).join(',');
+    return [
+        'var _fns2=[' + fnArr + '],_names2=[' + nameArr + '];',
+        'var _params2=[' + paramArr + '];',
+        'var _tI3="ABCDEFGHabcdefg1",_tI4="ZYXWVUTS98765432";',
+        'for(var _j=0;_j<_params2.length;_j++){',
+        '  var _fj=_params2[_j][0],_rj=_params2[_j][1],_pj=_params2[_j][2];',
+        '  if(typeof _fns2[_fj]!=="function")continue;',
+        '  try{',
+        '    var _rr=_fns2[_fj](_rj,_pj,_tI3);',
+        '    if(typeof _rr==="string"&&_rr!==_tI3&&_rr.length>0&&_rr.length<200){',
+        '      var _rr2=_fns2[_fj](_rj,_pj,_tI3),_rr3=_fns2[_fj](_rj,_pj,_tI4);',
+        '      if(_rr===_rr2&&typeof _rr3==="string"&&_rr3!==_rr){',
+        '        (function(fj,rj,pj){_result.n=function(n){return _fns2[fj](rj,pj,n);};})',
+        '        (_fj,_rj,_pj);',
+        '        _result._nName=_names2[_fj]+"("+_rj+","+_pj+",n)";',
+        '        break;',
+        '      }',
+        '    }',
+        '  }catch(e){}',
+        '}'
+    ].join('\n');
+}
+
+/**
  * Build probe for a single cached function (fast path).
  */
 function buildCachedProbe(funcName, r, p) {
@@ -148,47 +178,101 @@ function buildCachedProbe(funcName, r, p) {
 function preprocessPlayer(data, solvedCache) {
     // --- Find candidates or use cache ---
     var probeBody;
+    var candidates = null;
+    var testEntries = null;
+
     if (solvedCache && solvedCache.funcName) {
         probeBody = buildCachedProbe(solvedCache.funcName, solvedCache.r, solvedCache.p);
     } else {
         var table = findStringTable(data);
         if (table) {
-            var candidates = findCandidates(data, table.tableVar, table.splitIdx);
+            candidates = findCandidates(data, table.tableVar, table.splitIdx);
             if (candidates.length > 0) {
-                var testEntries = [], seen = {};
+                testEntries = [];
+                var seen = {};
                 for (var fi = 0; fi < candidates.length; fi++) {
                     for (var bi = 0; bi < candidates[fi].bases.length; bi++) {
                         var base = candidates[fi].bases[bi];
-                        for (var r = 0; r <= 30; r++) {
+                        for (var r = 0; r <= 50; r++) {
                             var p = base ^ r;
                             var key = fi + ':' + r + ',' + p;
                             if (!seen[key]) { seen[key] = true; testEntries.push({ fi: fi, r: r, p: p }); }
                         }
                     }
                 }
-                probeBody = buildProbe(candidates, testEntries);
+                // Build two-layer probe: try direct names first, then _df fallback
+                var directProbe = buildProbe(candidates, testEntries);
+                var dfProbe = buildDfProbe(candidates, testEntries);
+                probeBody = directProbe + '\nif(!_result.n){\n' + dfProbe + '\n}';
             }
         }
     }
     if (!probeBody) probeBody = '/* no candidates found */';
 
-    // --- Wrap player in try-catch, append probe ---
-    // No _df injection, no brace matching, no comma insertion.
-    // The probe references functions BY NAME. Functions survive because
-    // the try-catch prevents the player from reaching overwrite code.
-    var iifeCloseIdx = data.lastIndexOf('}).call(this)');
-    if (iifeCloseIdx === -1) iifeCloseIdx = data.lastIndexOf('})(_yt_player)');
-    if (iifeCloseIdx === -1) iifeCloseIdx = data.lastIndexOf('})(');
-
-    if (iifeCloseIdx !== -1) {
-        var strictIdx = data.indexOf("'use strict';");
-        var afterStrict = strictIdx !== -1 ? strictIdx + "'use strict';".length : data.indexOf('{') + 1;
-        return SETUP_CODE + '\n' +
-            data.substring(0, afterStrict) + '\ntry{\n' +
-            data.substring(afterStrict, iifeCloseIdx) + '\n}catch(_e){}\n' +
-            probeBody + '\n' +
-            data.substring(iifeCloseIdx);
+    // --- Inject _df assignments at chain boundaries ---
+    // These capture functions before they get overwritten later in execution.
+    // Used as fallback when direct-by-name fails (player ran to completion).
+    var modified = data;
+    if (candidates && candidates.length > 0) {
+        var injections = [];
+        for (var i = 0; i < candidates.length; i++) {
+            var c = candidates[i];
+            var defIdx = modified.indexOf(c.funcName + '=function(');
+            if (defIdx === -1) continue;
+            // Find chain boundary: ;\n followed by function or var at line start
+            var searchFrom = defIdx;
+            var chainEnd = -1;
+            while (searchFrom < modified.length) {
+                var nextSemiNl = modified.indexOf(';\n', searchFrom);
+                if (nextSemiNl === -1) break;
+                var afterSemi = modified.substring(nextSemiNl + 2, nextSemiNl + 12);
+                if (afterSemi.indexOf('function ') === 0 || afterSemi.indexOf('var ') === 0) {
+                    chainEnd = nextSemiNl + 1;
+                    break;
+                }
+                searchFrom = nextSemiNl + 2;
+            }
+            if (chainEnd !== -1) {
+                injections.push({ pos: chainEnd, code: '\ntry{_df' + i + '=' + c.funcName + ';}catch(e){}' });
+            }
+        }
+        // Merge and inject (descending order)
+        var mergedByPos = {};
+        for (var j = 0; j < injections.length; j++) {
+            var p = injections[j].pos;
+            if (!mergedByPos[p]) mergedByPos[p] = '';
+            mergedByPos[p] += injections[j].code;
+        }
+        var sorted = Object.keys(mergedByPos).map(Number).sort(function(a, b) { return b - a; });
+        for (var j = 0; j < sorted.length; j++) {
+            var pos = sorted[j];
+            modified = modified.substring(0, pos) + mergedByPos[pos] + modified.substring(pos);
+        }
     }
 
-    return SETUP_CODE + '\n' + data + '\n;(function(){' + probeBody + '})();';
+    // --- Wrap player in try-catch, declare _df vars, append probe ---
+    var iifeCloseIdx = modified.lastIndexOf('}).call(this)');
+    if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(_yt_player)');
+    if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(');
+
+    if (iifeCloseIdx !== -1) {
+        var strictIdx = modified.indexOf("'use strict';");
+        var afterStrict = strictIdx !== -1 ? strictIdx + "'use strict';".length : modified.indexOf('{') + 1;
+
+        // Declare _df vars before try (accessible in probe after catch)
+        var dfDecl = '';
+        if (candidates && candidates.length > 0) {
+            var dfNames = [];
+            for (var i = 0; i < candidates.length; i++) dfNames.push('_df' + i);
+            dfDecl = '\nvar ' + dfNames.join(',') + ';\n';
+        }
+
+        return SETUP_CODE + '\n' +
+            modified.substring(0, afterStrict) + dfDecl + '\ntry{\n' +
+            modified.substring(afterStrict, iifeCloseIdx) + '\n}catch(_e){}\n' +
+            probeBody + '\n' +
+            modified.substring(iifeCloseIdx);
+    }
+
+    return SETUP_CODE + '\n' + modified + '\n;(function(){' + probeBody + '})();';
 }
