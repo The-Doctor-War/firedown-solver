@@ -1,5 +1,5 @@
 // =============================================================================
-// YouTube N-Parameter Solver — Remote Module v4 -> v6
+// YouTube N-Parameter Solver — Remote Module v4 -> v7
 // Hosted at: https://github.com/solarizeddev/firedown-solver
 // The background.js shell fetches, caches, and executes this module.
 //
@@ -7,8 +7,14 @@
 // The cipher function is obfuscated with the same string table + XOR pattern
 // as the n-param function, but lives in the 'main' player variant (base.js)
 // rather than the TV variant.
+//
+// v7 additions: preprocessPlayer() now supports base.js (main player variant)
+// The TV player no longer contains the n-param challenge function as of
+// player version ace4b2f8 (March 2026). findStringTable search window
+// increased to 5000 chars and 'use strict' fallback added to preprocessPlayer
+// to handle base.js copyright header offset.
 // =============================================================================
-var SOLVER_VERSION = 6;
+var SOLVER_VERSION = 7;
 
 var SETUP_CODE = [
     'if(typeof globalThis.XMLHttpRequest==="undefined"){globalThis.XMLHttpRequest={prototype:{}};}',
@@ -38,7 +44,7 @@ var SETUP_CODE = [
  * Handles: "...".split(";"), '...'.split("}"), ["...","..."]
  */
 function findStringTable(data) {
-    var chunk = data.substring(0, 2000);
+    var chunk = data.substring(0, 5000);
     var splitCalls = chunk.matchAll(/\.split\((['"])(.)(\1)\)/g);
     for (var sc of splitCalls) {
         var delimiter = sc[2], splitPos = sc.index;
@@ -73,7 +79,7 @@ function findStringTable(data) {
  * Returns array of { funcName, bases: number[] }
  */
 function findCandidates(data, tableVar, splitIdx) {
-    var earlyChunk = data.substring(0, Math.min(data.length, 30000));
+    var earlyChunk = data.substring(0, Math.min(data.length, 60000));
     var funcDefs = earlyChunk.matchAll(/(?:^|[^a-zA-Z0-9_$])(?:var\s+)?(\w+)=function\((\w+(?:,\w+){2,})\)\{/g);
     var candidates = [];
     for (var fd of funcDefs) {
@@ -201,6 +207,14 @@ function preprocessPlayer(data, solvedCache) {
         probeBody = buildCachedProbe(solvedCache.funcName, solvedCache.r, solvedCache.p);
     } else {
         var table = findStringTable(data);
+        // base.js has its string table after copyright comments (~3KB in),
+        // so try findStringTable on the source starting from 'use strict'
+        if (!table) {
+            var usIdx = data.indexOf("'use strict';");
+            if (usIdx > 0 && usIdx < 10000) {
+                table = findStringTable(data.substring(usIdx));
+            }
+        }
         if (table) {
             candidates = findCandidates(data, table.tableVar, table.splitIdx);
             if (candidates.length > 0) {
