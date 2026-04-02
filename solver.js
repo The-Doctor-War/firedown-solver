@@ -1,5 +1,5 @@
 // =============================================================================
-// YouTube N-Parameter Solver — Remote Module v4 -> v7
+// YouTube N-Parameter Solver — Remote Module v4 -> v8
 // Hosted at: https://github.com/solarizeddev/firedown-solver
 // The background.js shell fetches, caches, and executes this module.
 //
@@ -13,8 +13,18 @@
 // player version ace4b2f8 (March 2026). findStringTable search window
 // increased to 5000 chars and 'use strict' fallback added to preprocessPlayer
 // to handle base.js copyright header offset.
+//
+// v8 fixes: Full base.js support for n-param solving.
+//   - findCandidates now searches the FULL file (not just first 60K)
+//   - Function name regex uses [\w$] to match $ in JS identifiers (G$, y$, etc.)
+//   - Property assignments (g.vu=function) are filtered out
+//   - Chain-boundary injection pattern matches [\w$]+=function identifiers
+//   - base.js executes WITHOUT try-catch wrapping (required for dispatch table
+//     initialization; base.js completes without error unlike TV player)
+//   - Probe prefers n-param over cipher results by checking for new chars
+//     in output (n-param generates new chars; cipher only permutes input chars)
 // =============================================================================
-var SOLVER_VERSION = 7;
+var SOLVER_VERSION = 8;
 
 var SETUP_CODE = [
     'if(typeof globalThis.XMLHttpRequest==="undefined"){globalThis.XMLHttpRequest={prototype:{}};}',
@@ -77,20 +87,29 @@ function findStringTable(data) {
 /**
  * Find candidate dispatch functions with XOR table accesses.
  * Returns array of { funcName, bases: number[] }
+ *
+ * v8: Searches the FULL file. Uses [\w$] for JS identifier matching.
+ *     Skips property assignments (g.X=function). Uses brace-matching for
+ *     function body isolation when safe (non-} delimiter), falls back to
+ *     fixed 2000-char window otherwise.
  */
 function findCandidates(data, tableVar, splitIdx) {
-    var earlyChunk = data.substring(0, Math.min(data.length, 60000));
-    var funcDefs = earlyChunk.matchAll(/(?:^|[^a-zA-Z0-9_$])(?:var\s+)?(\w+)=function\((\w+(?:,\w+){2,})\)\{/g);
+    // Detect if } is the string table delimiter (brace matching is unreliable then)
+    var delimMatch = data.substring(0, 10000).match(/\.split\((['"])(.)(\1)\)/);
+    var unsafeBraces = delimMatch && delimMatch[2] === '}';
+    // v8: [\w$] matches $ in function names like G$, y$
+    var funcDefs = data.matchAll(/(?:^|[^a-zA-Z0-9_$.])(?:var\s+)?([\w$]+)=function\(([\w$]+(?:,[\w$]+){2,})\)\{/g);
     var candidates = [];
     for (var fd of funcDefs) {
         var funcName = fd[1];
-        var defPos = data.indexOf(funcName + '=function(');
+        var defPos = data.indexOf(funcName + '=function(', fd.index);
         if (defPos === -1) continue;
-        // Isolate function body via brace matching to avoid picking up
-        // XOR accesses from neighboring functions
+        // v8: Skip property assignments like g.vu=function(
+        if (defPos > 0 && data[defPos - 1] === '.') continue;
+        // Isolate function body via brace matching (when delimiter isn't })
         var bodyStart = data.indexOf('{', defPos);
         var funcBody = null;
-        if (bodyStart !== -1) {
+        if (!unsafeBraces && bodyStart !== -1) {
             var depth = 0, pos = bodyStart;
             while (pos < data.length) {
                 if (data[pos] === '{') depth++;
@@ -98,8 +117,7 @@ function findCandidates(data, tableVar, splitIdx) {
                 pos++;
             }
         }
-        // If brace matching fails (e.g. } in string literals), fall back to a
-        // conservative 2000-char window from defPos
+        // v8: Fall back to 2000-char window when brace matching is unsafe or fails
         var searchText = funcBody || data.substring(defPos, Math.min(defPos + 2000, data.length));
         var xorRx = new RegExp(tableVar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\[\\w+\\^(\\d+)\\]', 'g');
         var bases = new Set(), xm;
@@ -114,6 +132,10 @@ function findCandidates(data, tableVar, splitIdx) {
  * Build probe code that tests candidates BY NAME (no _df injection needed).
  * Functions survive because try-catch prevents the player from reaching
  * the code that would overwrite them.
+ *
+ * v8: Added _hasNewChars check to prefer n-param results over cipher results.
+ * The n-param transform generates new characters not in the input, while
+ * the cipher function only rearranges existing characters.
  */
 function buildProbe(candidates, testEntries) {
     var fnArr = candidates.map(function(c) { return c.funcName; }).join(',');
@@ -123,13 +145,17 @@ function buildProbe(candidates, testEntries) {
         'var _fns=[' + fnArr + '],_names=[' + nameArr + '];',
         'var _params=[' + paramArr + '];',
         'var _tI="ABCDEFGHabcdefg1",_tI2="ZYXWVUTS98765432";',
+        // v8: helper to check if output contains chars not in input
+        'function _hasNewChars(a,b){var s=new Set(a.split(""));for(var i=0;i<b.length;i++)if(!s.has(b[i]))return true;return false;}',
         'for(var _i=0;_i<_params.length;_i++){',
         '  var _fi=_params[_i][0],_r=_params[_i][1],_p=_params[_i][2];',
         '  try{',
         '    var _res=_fns[_fi](_r,_p,_tI);',
         '    if(typeof _res==="string"&&_res!==_tI&&_res.length>0&&_res.length<200){',
         '      var _res2=_fns[_fi](_r,_p,_tI),_res3=_fns[_fi](_r,_p,_tI2);',
-        '      if(_res===_res2&&typeof _res3==="string"&&_res3!==_res){',
+        '      if(_res===_res2&&typeof _res3==="string"&&_res3!==_res',
+        // v8: prefer n-param (has new chars) over cipher (only permutes)
+        '        &&_hasNewChars(_tI,_res)){',
         '        (function(fi,r,p){_result.n=function(n){return _fns[fi](r,p,n);};})',
         '        (_fi,_r,_p);',
         '        _result._nName=_names[_fi]+"("+_r+","+_p+",n)";',
@@ -152,6 +178,7 @@ function buildDfProbe(candidates, testEntries) {
         'var _fns2=[' + fnArr + '],_names2=[' + nameArr + '];',
         'var _params2=[' + paramArr + '];',
         'var _tI3="ABCDEFGHabcdefg1",_tI4="ZYXWVUTS98765432";',
+        'function _hasNewChars2(a,b){var s=new Set(a.split(""));for(var i=0;i<b.length;i++)if(!s.has(b[i]))return true;return false;}',
         'for(var _j=0;_j<_params2.length;_j++){',
         '  var _fj=_params2[_j][0],_rj=_params2[_j][1],_pj=_params2[_j][2];',
         '  if(typeof _fns2[_fj]!=="function")continue;',
@@ -159,7 +186,8 @@ function buildDfProbe(candidates, testEntries) {
         '    var _rr=_fns2[_fj](_rj,_pj,_tI3);',
         '    if(typeof _rr==="string"&&_rr!==_tI3&&_rr.length>0&&_rr.length<200){',
         '      var _rr2=_fns2[_fj](_rj,_pj,_tI3),_rr3=_fns2[_fj](_rj,_pj,_tI4);',
-        '      if(_rr===_rr2&&typeof _rr3==="string"&&_rr3!==_rr){',
+        '      if(_rr===_rr2&&typeof _rr3==="string"&&_rr3!==_rr',
+        '        &&_hasNewChars2(_tI3,_rr)){',
         '        (function(fj,rj,pj){_result.n=function(n){return _fns2[fj](rj,pj,n);};})',
         '        (_fj,_rj,_pj);',
         '        _result._nName=_names2[_fj]+"("+_rj+","+_pj+",n)";',
@@ -192,8 +220,27 @@ function buildCachedProbe(funcName, r, p) {
 }
 
 /**
+ * Detect whether the player is a base.js (main) variant or TV player variant.
+ * base.js uses }).call(this) to close its IIFE and has a copyright header
+ * before 'use strict'. TV player uses })(_yt_player).
+ *
+ * base.js executes without error in the sandbox (no DOM dependencies during init),
+ * so it does NOT need try-catch wrapping. In fact, try-catch wrapping breaks
+ * base.js because it prevents initialization of functions referenced in the
+ * n-param dispatch table.
+ */
+function isBaseJsVariant(data) {
+    // base.js has a copyright header before 'use strict', pushing it to ~3KB offset.
+    // TV player has 'use strict' at or very near the start (offset 0-100).
+    // This is the most reliable distinguisher since both variants use })(_yt_player).
+    var usIdx = data.indexOf("'use strict';");
+    if (usIdx > 1000 && usIdx < 10000) return true;
+    return false;
+}
+
+/**
  * Main entry point for n-parameter solving.
- * @param {string} data - Full player.js source (TV variant preferred)
+ * @param {string} data - Full player.js source (TV variant or base.js)
  * @param {object|null} solvedCache - {funcName, r, p} from previous solve
  * @returns {string} - Code ready for Function("_result", code)(resultObj)
  */
@@ -239,9 +286,13 @@ function preprocessPlayer(data, solvedCache) {
     }
     if (!probeBody) probeBody = '/* no candidates found */';
 
+    // --- Detect player variant ---
+    var baseJs = isBaseJsVariant(data);
+
     // --- Inject _df captures using multiple strategies ---
+    // v8: Skip _df injection for base.js (not needed without try-catch)
     var modified = data;
-    if (candidates && candidates.length > 0) {
+    if (!baseJs && candidates && candidates.length > 0) {
         // Strategy 1: Comma injection inside var chains (most reliable)
         var tableDelimiter = null;
         var delimMatch = data.substring(0, 2000).match(/\.split\((['"])(.)(\1)\)/);
@@ -283,8 +334,11 @@ function preprocessPlayer(data, solvedCache) {
             while (searchFrom < modified.length) {
                 var nextSemiNl = modified.indexOf(';\n', searchFrom);
                 if (nextSemiNl === -1) break;
-                var afterSemi = modified.substring(nextSemiNl + 2, nextSemiNl + 12);
-                if (afterSemi.indexOf('function ') === 0 || afterSemi.indexOf('var ') === 0) {
+                // v8: limit search distance to avoid runaway scanning
+                if (nextSemiNl - defIdx > 10000) break;
+                var afterSemi = modified.substring(nextSemiNl + 2, nextSemiNl + 32);
+                // v8: [\w$] to match $ in identifiers like $EN
+                if (/^(?:function |var |[\w$]+=function\()/.test(afterSemi)) {
                     chainEnd = nextSemiNl + 1;
                     break;
                 }
@@ -307,7 +361,7 @@ function preprocessPlayer(data, solvedCache) {
         }
     }
 
-    // --- Wrap player in try-catch, declare _df vars, append probe ---
+    // --- Wrap player and append probe ---
     var iifeCloseIdx = modified.lastIndexOf('}).call(this)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(_yt_player)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(');
@@ -316,6 +370,20 @@ function preprocessPlayer(data, solvedCache) {
         var strictIdx = modified.indexOf("'use strict';");
         var afterStrict = strictIdx !== -1 ? strictIdx + "'use strict';".length : modified.indexOf('{') + 1;
 
+        if (baseJs) {
+            // v8: base.js — NO try-catch wrapping.
+            // base.js executes fully without error in the sandbox. Wrapping in
+            // try-catch would prevent initialization of functions in the n-param
+            // dispatch table, causing the transform to fail silently.
+            // Probe code is injected just before the IIFE close, within the
+            // IIFE scope where all functions are accessible.
+            return SETUP_CODE + '\n' +
+                modified.substring(0, iifeCloseIdx) + '\n' +
+                probeBody + '\n' +
+                modified.substring(iifeCloseIdx);
+        }
+
+        // TV player: wrap in try-catch (existing behavior)
         // Declare _df vars before try (accessible in probe after catch)
         var dfDecl = '';
         if (candidates && candidates.length > 0) {
@@ -336,36 +404,30 @@ function preprocessPlayer(data, solvedCache) {
 
 // =============================================================================
 // SIGNATURE CIPHER DETECTION — v6 addition
-// Runs against the 'main' player variant (base.js) to find the cipher function.
-//
-// The cipher function is a multi-dispatch function (like KX) that contains a
-// branch activated by specific 'c' argument values where (c>>1&15)==4.
-// That branch: splits a string into chars, applies reverse/splice/swap ops
-// via a helper object, and joins back. Same string table + XOR obfuscation.
-//
-// Detection strategy:
-// 1. Find ALL multi-param functions with XOR table accesses (full file scan)
-// 2. Build probe that tests with cipher-specific c values (8,9,40,41)
-// 3. Verify result is a character permutation (same length, same sorted chars)
-// 4. Store in _result.sig
 // =============================================================================
 
 /**
  * Find cipher candidates — searches the FULL file for multi-param functions
- * with XOR table accesses. Unlike findCandidates (n-param, first 30KB only),
- * this scans the entire source because the cipher function can be deep in the file.
+ * with XOR table accesses.
+ *
+ * v8: Uses [\w$] for identifier matching, skips property assignments.
  */
 function findCipherCandidates(data, tableVar, splitIdx) {
     var escaped = tableVar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    var funcDefs = data.matchAll(/(?:^|[^a-zA-Z0-9_$])(?:var\s+)?(\w+)=function\((\w+(?:,\w+){2,})\)\{/g);
+    var delimMatch = data.substring(0, 10000).match(/\.split\((['"])(.)(\1)\)/);
+    var unsafeBraces = delimMatch && delimMatch[2] === '}';
+    // v8: [\w$] matches $ in function names
+    var funcDefs = data.matchAll(/(?:^|[^a-zA-Z0-9_$.])(?:var\s+)?([\w$]+)=function\(([\w$]+(?:,[\w$]+){2,})\)\{/g);
     var candidates = [];
     for (var fd of funcDefs) {
         var funcName = fd[1];
         var defPos = data.indexOf(funcName + '=function(', fd.index);
         if (defPos === -1) continue;
+        // v8: Skip property assignments
+        if (defPos > 0 && data[defPos - 1] === '.') continue;
         var bodyStart = data.indexOf('{', defPos);
         var funcBody = null;
-        if (bodyStart !== -1) {
+        if (!unsafeBraces && bodyStart !== -1) {
             var depth = 0, pos = bodyStart;
             while (pos < data.length) {
                 if (data[pos] === '{') depth++;
@@ -390,13 +452,6 @@ function findCipherCandidates(data, tableVar, splitIdx) {
 
 /**
  * Build cipher probe code.
- *
- * The cipher branch in the multi-dispatch function activates when (c>>1&15)==4,
- * i.e. c values: 8, 9, 24, 25, 40, 41.
- *
- * The probe calls func(c, p, testSig) for cipher-valid c values and checks
- * if the result is a character permutation of the input (same length, same
- * sorted characters, but different order).
  */
 function buildCipherProbe(candidates, testEntries) {
     var fnArr = candidates.map(function(c) { return c.funcName; }).join(',');
@@ -405,17 +460,14 @@ function buildCipherProbe(candidates, testEntries) {
     return [
         'var _cfns=[' + fnArr + '],_cnames=[' + nameArr + '];',
         'var _cparams=[' + paramArr + '];',
-        // Long test signature — cipher preserves length and character set (permutation)
         'var _cSig="AOq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHn4";',
         'var _cSig2="ZZq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHZZ";',
         'function _isCipherResult(input,output){',
         '  if(typeof output!=="string")return false;',
         '  if(output===input)return false;',
         '  if(output.length<20)return false;',
-        // Must be same length or slightly shorter (splice removes chars)
         '  if(output.length>input.length)return false;',
         '  if(output.length<input.length-10)return false;',
-        // Deterministic: same input -> same output
         '  return true;',
         '}',
         'for(var _ci=0;_ci<_cparams.length&&!_result.sig;_ci++){',
@@ -423,7 +475,6 @@ function buildCipherProbe(candidates, testEntries) {
         '  try{',
         '    var _cres=_cfns[_cfi](_cr,_cp,_cSig);',
         '    if(_isCipherResult(_cSig,_cres)){',
-        // Verify deterministic + different input gives different output
         '      var _cres2=_cfns[_cfi](_cr,_cp,_cSig);',
         '      var _cres3=_cfns[_cfi](_cr,_cp,_cSig2);',
         '      if(_cres===_cres2&&_cres3!==_cres&&_isCipherResult(_cSig2,_cres3)){',
@@ -480,19 +531,17 @@ function buildDfCipherProbe(candidates, testEntries) {
 
 /**
  * Cipher entry point — extract signature cipher function from base.js.
- * Called separately from preprocessPlayer (which handles n-param on TV player).
+ * Called separately from preprocessPlayer (which handles n-param).
  *
  * @param {string} data - Full player.js source (main/base.js variant)
  * @param {object|null} cipherCache - {funcName, r, p} from previous solve
  * @returns {string} - Code ready for Function("_result", code)(resultObj)
- *                      Populates _result.sig (cipher function) and _result._sigName
  */
 function preprocessCipher(data, cipherCache) {
     var probeBody;
     var candidates = null;
 
     if (cipherCache && cipherCache.funcName) {
-        // Fast path: use cached params
         probeBody = [
             'var _cSig="AOq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHn4";',
             'var _cSig2="ZZq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHZZ";',
@@ -509,8 +558,6 @@ function preprocessCipher(data, cipherCache) {
             '}catch(e){}'
         ].join('\n');
     } else {
-        // base.js has its string table after copyright comments (~3KB in),
-        // so try findStringTable on the source starting from 'use strict'
         var table = findStringTable(data);
         if (!table) {
             var strictIdx = data.indexOf("'use strict';");
@@ -521,8 +568,6 @@ function preprocessCipher(data, cipherCache) {
         if (table) {
             candidates = findCipherCandidates(data, table.tableVar, table.splitIdx);
             if (candidates.length > 0) {
-                // Build test entries: for cipher, use c values where (c>>1&15)==4
-                // Valid c: 8, 9, 40, 41 (within r=0..50 range)
                 var cipherCValues = [8, 9, 40, 41];
                 var testEntries = [];
                 var seen = {};
@@ -530,16 +575,14 @@ function preprocessCipher(data, cipherCache) {
                     for (var bi = 0; bi < candidates[fi].bases.length; bi++) {
                         var base = candidates[fi].bases[bi];
                         for (var ci = 0; ci < cipherCValues.length; ci++) {
-                            var r = cipherCValues[ci]; // r_solver = c in KX
-                            var p = base ^ r;           // p_solver = r in KX, so P = base
+                            var r = cipherCValues[ci];
+                            var p = base ^ r;
                             var key = fi + ':' + r + ',' + p;
                             if (!seen[key]) { seen[key] = true; testEntries.push({ fi: fi, r: r, p: p }); }
                         }
                     }
                 }
                 probeBody = buildCipherProbe(candidates, testEntries);
-
-                // Also build _df fallback probe (same pattern as n-param solver)
                 var dfCipherProbe = buildDfCipherProbe(candidates, testEntries);
                 probeBody = probeBody + '\nif(!_result.sig){\n' + dfCipherProbe + '\n}';
             }
@@ -548,9 +591,12 @@ function preprocessCipher(data, cipherCache) {
 
     if (!probeBody) probeBody = '/* no cipher candidates found */';
 
-    // --- Inject _df captures and wrap player (mirrors preprocessPlayer) ---
+    // --- Detect player variant ---
+    var baseJs = isBaseJsVariant(data);
+
+    // --- Inject _df captures and wrap player ---
     var modified = data;
-    if (candidates && candidates.length > 0) {
+    if (!baseJs && candidates && candidates.length > 0) {
         var tableDelimiter = null;
         var delimMatch = data.substring(0, 10000).match(/\.split\((['"])(.)(\1)\)/);
         if (delimMatch) tableDelimiter = delimMatch[2];
@@ -591,8 +637,10 @@ function preprocessCipher(data, cipherCache) {
             while (searchFrom < modified.length) {
                 var nextSemiNl = modified.indexOf(';\n', searchFrom);
                 if (nextSemiNl === -1) break;
-                var afterSemi = modified.substring(nextSemiNl + 2, nextSemiNl + 12);
-                if (afterSemi.indexOf('function ') === 0 || afterSemi.indexOf('var ') === 0) {
+                if (nextSemiNl - defIdx > 10000) break;
+                var afterSemi = modified.substring(nextSemiNl + 2, nextSemiNl + 32);
+                // v8: [\w$] to match $ in identifiers
+                if (/^(?:function |var |[\w$]+=function\()/.test(afterSemi)) {
                     chainEnd = nextSemiNl + 1;
                     break;
                 }
@@ -615,7 +663,7 @@ function preprocessCipher(data, cipherCache) {
         }
     }
 
-    // Wrap player in try-catch, declare _cdf vars, append probe
+    // Wrap player
     var iifeCloseIdx = modified.lastIndexOf('}).call(this)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(_yt_player)');
     if (iifeCloseIdx === -1) iifeCloseIdx = modified.lastIndexOf('})(');
@@ -623,6 +671,14 @@ function preprocessCipher(data, cipherCache) {
     if (iifeCloseIdx !== -1) {
         var strictIdx = modified.indexOf("'use strict';");
         var afterStrict = strictIdx !== -1 ? strictIdx + "'use strict';".length : modified.indexOf('{') + 1;
+
+        if (baseJs) {
+            // v8: base.js — no try-catch wrapping for cipher either
+            return SETUP_CODE + '\n' +
+                modified.substring(0, iifeCloseIdx) + '\n' +
+                probeBody + '\n' +
+                modified.substring(iifeCloseIdx);
+        }
 
         var dfDecl = '';
         if (candidates && candidates.length > 0) {
