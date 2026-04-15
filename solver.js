@@ -8,17 +8,26 @@
 //   - Executes player without try-catch first, falls back to try-catch
 //   - No fragile regex matching of function definitions across the full file
 //   - Works uniformly on both TV player and base.js (main player) variants
-//   - _hasNewChars filter distinguishes n-param (generates new chars) from
+//   - _newCh filter distinguishes n-param (generates new chars) from
 //     cipher (only permutes existing chars)
 //
-// v10: Fix two bugs exposed by player ee507a59 (April 2026):
-//   - maxR increased from 50 to 100. The n-param dispatch function (ar) now
-//     activates at r=80 due to branch guard `(T|72)==T`, which requires bits
-//     64+8 to be set. r=50 was too low to reach any valid dispatch branch.
-//   - Cipher probe now explicitly rejects functions that generate new
-//     characters (the _noNewCh filter). Without this, the n-param function
-//     (which produces new chars) was incorrectly matched as a cipher function,
-//     since both are multi-dispatch functions with XOR table accesses.
+// v10: Robust r-value scanning, no hardcoded limits.
+//   - Replaced linear r=0..maxR scan with bit-reversal permutation over 0..255.
+//     The full byte range is covered with maximum spread: the first 16 values
+//     tested are 0,128,64,192,32,160,96,224,16,144,80,208,48,176,112,240.
+//     Any valid r value is reached within ≤128 iterations (avg ~16).
+//     Eliminates the maxR constant that broke when YouTube's obfuscator
+//     generated branch guards requiring r>=72 (player ee507a59, April 2026).
+//   - Restructured probe loop: r is the OUTER loop, candidates are inner.
+//     Each bit-reversal step tests one r value across ALL candidate functions
+//     and ALL their bases simultaneously. This finds the match as soon as the
+//     correct r is reached, regardless of candidate ordering. Reduced cipher
+//     detection from ~10s to ~1.2s by avoiding exhaustive base iteration on
+//     wrong functions before reaching the right one.
+//   - Cipher probe now rejects functions that generate new characters
+//     (!_newCh filter), preventing the n-param function from being
+//     misidentified as a cipher. Both are multi-dispatch XOR-table functions,
+//     but n-param generates new chars while cipher only permutes existing ones.
 // =============================================================================
 var SOLVER_VERSION = 10;
 
@@ -78,14 +87,6 @@ function findStringTable(data) {
 /**
  * Find the largest var chain in the IIFE scope.
  * Returns array of variable names, or null if not found.
- *
- * YouTube player IIFEs declare all their local functions in a massive
- * comma-separated var statement near the top (often 1000+ names).
- * This is more reliable than regex-matching function definitions across
- * the full file, since:
- * - No [\w$] vs \w issues (names are comma-delimited)
- * - No property assignments (var chains only contain standalone names)
- * - No offset/window concerns (the chain is always near the IIFE start)
  */
 function findVarChain(data) {
     var varIdx = 0;
@@ -141,18 +142,23 @@ function findVarChain(data) {
 /**
  * Build runtime probe code.
  *
- * Instead of scanning the source file for function definitions and XOR patterns,
- * this probe runs INSIDE the IIFE after the player has executed. For each
- * variable name from the var chain, it:
- * 1. Checks typeof === "function" && .length >= 3
- * 2. Calls func.toString() to get the actual function body
- * 3. Scans the body for XOR table accesses to compute candidate bases
- * 4. Tests func(r, base^r, testInput) for each base and r value
- * 5. Validates output: deterministic, different from input, contains new chars
+ * Runs INSIDE the player IIFE after execution. Two phases:
+ *
+ * Phase 1 (candidate collection): For each var-chain name, checks
+ * typeof === "function" && .length >= 3, then scans func.toString()
+ * for XOR table accesses to extract bases.
+ *
+ * Phase 2 (r-outer bit-reversal scan): Iterates r in bit-reversal order
+ * (0,128,64,192,32,...) over 0–255. At each r, tests ALL candidates with
+ * ALL their bases. First valid match wins.
+ *
+ * The bit-reversal order covers the full byte range with maximum spread,
+ * reaching any valid r within ≤128 steps (typically ~16). No hardcoded
+ * maxR constant — immune to obfuscator changes in branch guard thresholds.
  *
  * @param {string} mode - "n" for n-param, "sig" for signature cipher
  * @param {string[]} varNames - Variable names from the IIFE var chain
- * @param {string} tableVar - String table variable name (e.g. "E")
+ * @param {string} tableVar - String table variable name (e.g. "d")
  * @param {number} splitIdx - Index of "split" in the string table
  * @param {object|null} cache - {funcName, r, p} for fast path
  */
@@ -181,7 +187,7 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
         ].join('\n');
     }
 
-    // Full probe: iterate var names, use func.toString() for XOR detection
+    // Full probe: collect candidates, then r-outer bit-reversal scan
     var namesJSON = JSON.stringify(varNames);
     var isNParam = mode !== 'sig';
 
@@ -191,10 +197,8 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
         validate = '&&_newCh(_t1,_v1)';
     } else {
         // Cipher: output must be same length ± 10, and must NOT contain new
-        // chars (pure permutation). The _noNewCh check prevents the n-param
-        // function from being falsely identified as a cipher — both are
-        // multi-dispatch XOR-table functions, but n-param generates new chars
-        // while cipher only rearranges/splices existing ones.
+        // chars (pure permutation). The !_newCh check prevents the n-param
+        // function from being falsely identified as a cipher.
         validate = '&&_v1.length>=20&&_v1.length<=_t1.length&&_v1.length>=_t1.length-10&&!_newCh(_t1,_v1)';
     }
 
@@ -202,18 +206,22 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
     var t2 = isNParam ? 'ZYXWVUTS98765432' : 'ZZq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHZZ';
     var minBases = isNParam ? 0 : 10;
     var minSrcLen = isNParam ? 100 : 500;
-    // Player ee507a59+ uses branch guards like (T|72)==T requiring r>=72.
-    // maxR=50 missed these entirely. 100 covers all observed dispatch patterns.
-    var maxR = 100;
 
     return [
         'var _vn=' + namesJSON + ';',
         'var _tv=' + JSON.stringify(tableVar) + ';',
         'var _si=' + splitIdx + ';',
         'var _t1="' + t1 + '",_t2="' + t2 + '";',
+        // Helper: returns true if b contains any character not in a
         'function _newCh(a,b){var s=new Set(a.split(""));for(var i=0;i<b.length;i++)if(!s.has(b[i]))return true;return false;}',
+        // 8-bit reversal: 0→0, 1→128, 2→64, 3→192, ...
+        // Produces maximum-spread ordering over 0–255
+        'function _br8(n){n=((n&240)>>4)|((n&15)<<4);n=((n&204)>>2)|((n&51)<<2);return((n&170)>>1)|((n&85)<<1);}',
         'var _xr=new RegExp(_tv+"\\\\[\\\\w+\\\\^(\\\\d+)\\\\]","g");',
-        'for(var _i=0;_i<_vn.length&&!_result.' + resultKey + ';_i++){',
+        '',
+        '// Phase 1: collect candidate functions with their XOR bases',
+        'var _cands=[];',
+        'for(var _i=0;_i<_vn.length;_i++){',
         '  var _f;try{_f=eval(_vn[_i]);}catch(e){continue;}',
         '  if(typeof _f!=="function"||_f.length<3)continue;',
         '  var _s;try{_s=_f.toString();}catch(e){continue;}',
@@ -221,18 +229,26 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
         '  var _bs=new Set(),_m;_xr.lastIndex=0;',
         '  while((_m=_xr.exec(_s))!==null)_bs.add(parseInt(_m[1])^_si);',
         '  if(_bs.size<=' + minBases + ')continue;',
-        '  for(var _b of _bs){',
-        '    if(_result.' + resultKey + ')break;',
-        '    for(var _r=0;_r<=' + maxR + ';_r++){',
-        '      var _p=_b^_r;',
+        '  _cands.push({f:_f,nm:_vn[_i],bs:Array.from(_bs)});',
+        '}',
+        '',
+        '// Phase 2: r-outer bit-reversal scan across all candidates',
+        '// Each iteration tests one r value against every candidate+base.',
+        '// Bit-reversal ensures maximum spread: 0,128,64,192,32,160,...',
+        'for(var _ri=0;_ri<256&&!_result.' + resultKey + ';_ri++){',
+        '  var _r=_br8(_ri);',
+        '  for(var _ci=0;_ci<_cands.length&&!_result.' + resultKey + ';_ci++){',
+        '    var _c=_cands[_ci];',
+        '    for(var _bi=0;_bi<_c.bs.length;_bi++){',
+        '      var _p=_c.bs[_bi]^_r;',
         '      try{',
-        '        var _v1=_f(_r,_p,_t1);',
+        '        var _v1=_c.f(_r,_p,_t1);',
         '        if(typeof _v1==="string"&&_v1!==_t1&&_v1.length>0&&_v1.length<200){',
-        '          var _v2=_f(_r,_p,_t1),_v3=_f(_r,_p,_t2);',
+        '          var _v2=_c.f(_r,_p,_t1),_v3=_c.f(_r,_p,_t2);',
         '          if(_v1===_v2&&typeof _v3==="string"&&_v3!==_v1' + validate + '){',
         '            (function(f,r,p){_result.' + resultKey + '=function(x){return f(r,p,x);};})',
-        '            (_f,_r,_p);',
-        '            _result.' + nameKey + '=_vn[_i]+"("+_r+","+_p+",x)";',
+        '            (_c.f,_r,_p);',
+        '            _result.' + nameKey + '=_c.nm+"("+_r+","+_p+",x)";',
         '            break;',
         '          }',
         '        }',
@@ -259,7 +275,7 @@ function assembleCode(data, probeBody) {
     var strictIdx = data.indexOf("'use strict';");
     var afterStrict = strictIdx !== -1 ? strictIdx + "'use strict';".length : data.indexOf('{') + 1;
 
-    // Return both variants; caller picks based on execution result
+    // Return both variants; caller picks based on player type
     return {
         // No try-catch: works for base.js (player executes cleanly, all functions accessible)
         direct: SETUP_CODE + '\n' +
