@@ -1,5 +1,5 @@
 // =============================================================================
-// YouTube N-Parameter Solver — Remote Module v9
+// YouTube N-Parameter Solver — Remote Module v10
 // Hosted at: https://github.com/solarizeddev/firedown-solver
 //
 // v9: Rewritten with abstract detection approach.
@@ -10,8 +10,17 @@
 //   - Works uniformly on both TV player and base.js (main player) variants
 //   - _hasNewChars filter distinguishes n-param (generates new chars) from
 //     cipher (only permutes existing chars)
+//
+// v10: Fix two bugs exposed by player ee507a59 (April 2026):
+//   - maxR increased from 50 to 100. The n-param dispatch function (ar) now
+//     activates at r=80 due to branch guard `(T|72)==T`, which requires bits
+//     64+8 to be set. r=50 was too low to reach any valid dispatch branch.
+//   - Cipher probe now explicitly rejects functions that generate new
+//     characters (the _noNewCh filter). Without this, the n-param function
+//     (which produces new chars) was incorrectly matched as a cipher function,
+//     since both are multi-dispatch functions with XOR table accesses.
 // =============================================================================
-var SOLVER_VERSION = 9;
+var SOLVER_VERSION = 10;
 
 var SETUP_CODE = [
     'if(typeof globalThis.XMLHttpRequest==="undefined"){globalThis.XMLHttpRequest={prototype:{}};}',
@@ -181,15 +190,21 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
         // N-param: output must contain new chars not in input
         validate = '&&_newCh(_t1,_v1)';
     } else {
-        // Cipher: output must be same length ± 10, no new chars needed
-        validate = '&&_v1.length>=20&&_v1.length<=_t1.length&&_v1.length>=_t1.length-10';
+        // Cipher: output must be same length ± 10, and must NOT contain new
+        // chars (pure permutation). The _noNewCh check prevents the n-param
+        // function from being falsely identified as a cipher — both are
+        // multi-dispatch XOR-table functions, but n-param generates new chars
+        // while cipher only rearranges/splices existing ones.
+        validate = '&&_v1.length>=20&&_v1.length<=_t1.length&&_v1.length>=_t1.length-10&&!_newCh(_t1,_v1)';
     }
 
     var t1 = isNParam ? 'ABCDEFGHabcdefg1' : 'AOq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHn4';
     var t2 = isNParam ? 'ZYXWVUTS98765432' : 'ZZq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHZZ';
     var minBases = isNParam ? 0 : 10;
     var minSrcLen = isNParam ? 100 : 500;
-    var maxR = 50;
+    // Player ee507a59+ uses branch guards like (T|72)==T requiring r>=72.
+    // maxR=50 missed these entirely. 100 covers all observed dispatch patterns.
+    var maxR = 100;
 
     return [
         'var _vn=' + namesJSON + ';',
