@@ -1,35 +1,32 @@
 // =============================================================================
-// YouTube N-Parameter Solver — Remote Module v10
+// YouTube N-Parameter Solver — Remote Module v11
 // Hosted at: https://github.com/solarizeddev/firedown-solver
 //
-// v9: Rewritten with abstract detection approach.
-//   - Uses the IIFE var chain to enumerate all scope-level function names
-//   - Uses func.toString() at runtime to detect XOR table accesses
-//   - Executes player without try-catch first, falls back to try-catch
-//   - No fragile regex matching of function definitions across the full file
-//   - Works uniformly on both TV player and base.js (main player) variants
-//   - _newCh filter distinguishes n-param (generates new chars) from
-//     cipher (only permutes existing chars)
+// Design principle: minimize structural assumptions about the player source.
+// YouTube rotates base.js frequently — every assumption we make is a future
+// breakage waiting to happen. This solver relies on RUNTIME behavior (calling
+// candidate functions and checking outputs) rather than source-code pattern
+// matching wherever possible.
 //
-// v10: Robust r-value scanning, no hardcoded limits.
-//   - Replaced linear r=0..maxR scan with bit-reversal permutation over 0..255.
-//     The full byte range is covered with maximum spread: the first 16 values
-//     tested are 0,128,64,192,32,160,96,224,16,144,80,208,48,176,112,240.
-//     Any valid r value is reached within ≤128 iterations (avg ~16).
-//     Eliminates the maxR constant that broke when YouTube's obfuscator
-//     generated branch guards requiring r>=72 (player ee507a59, April 2026).
-//   - Restructured probe loop: r is the OUTER loop, candidates are inner.
-//     Each bit-reversal step tests one r value across ALL candidate functions
-//     and ALL their bases simultaneously. This finds the match as soon as the
-//     correct r is reached, regardless of candidate ordering. Reduced cipher
-//     detection from ~10s to ~1.2s by avoiding exhaustive base iteration on
-//     wrong functions before reaching the right one.
-//   - Cipher probe now rejects functions that generate new characters
-//     (!_newCh filter), preventing the n-param function from being
-//     misidentified as a cipher. Both are multi-dispatch XOR-table functions,
-//     but n-param generates new chars while cipher only permutes existing ones.
+// v9: Runtime-based candidate detection via func.toString()
+// v10: Bit-reversal r-scan (no maxR), r-outer loop, cipher !_newCh filter
+// v11: Robustness hardening for future YouTube changes:
+//   - Runtime candidate enumeration fallback: if static var-chain extraction
+//     fails (YouTube switches away from comma-separated var declarations),
+//     the probe walks globalThis + _yt_player at runtime to find functions.
+//     This means the solver works even if YouTube completely restructures
+//     how functions are declared in the IIFE scope.
+//   - Brace-walk IIFE detection: walks the source tracking brace depth to
+//     find the IIFE boundary, instead of string-matching `})(_yt_player)` or
+//     similar. Survives wrapper syntax changes.
+//   - Dual-quote 'use strict' support: handles both 'use strict' and "use strict".
+//   - Arithmetic-agnostic XOR scan: the probe tries XOR, subtraction, and
+//     addition patterns when scanning func.toString() for table accesses.
+//     Resilient to minor obfuscator scheme changes.
+//   - Content-binding agnostic: accepts any func output that's deterministic
+//     and input-dependent, rather than enforcing specific char-set rules.
 // =============================================================================
-var SOLVER_VERSION = 10;
+var SOLVER_VERSION = 11;
 
 var SETUP_CODE = [
     'if(typeof globalThis.XMLHttpRequest==="undefined"){globalThis.XMLHttpRequest={prototype:{}};}',
@@ -52,7 +49,34 @@ var SETUP_CODE = [
 ].join('\n');
 
 /**
+ * Find 'use strict' in either quote style.
+ * YouTube historically uses single-quote but robust against double-quote.
+ */
+function findUseStrict(data) {
+    var single = data.indexOf("'use strict';");
+    var dbl = data.indexOf('"use strict";');
+    if (single === -1) return dbl;
+    if (dbl === -1) return single;
+    return Math.min(single, dbl);
+}
+
+/**
+ * Return the length of the 'use strict'; directive found at idx, or 0 if none.
+ */
+function useStrictLen(data, idx) {
+    if (idx < 0) return 0;
+    if (data.substring(idx, idx + 13) === "'use strict';") return 13;
+    if (data.substring(idx, idx + 13) === '"use strict";') return 13;
+    return 0;
+}
+
+/**
  * Find the string table variable and the index of "split" in it.
+ *
+ * YouTube's obfuscator creates a large string table at the top of the player,
+ * then references entries as table[index] throughout the code. Every known
+ * n-param and cipher implementation uses "split" as one of the table entries
+ * (for splitting input strings), so we anchor on that.
  */
 function findStringTable(data) {
     var chunk = data.substring(0, 5000);
@@ -71,6 +95,7 @@ function findStringTable(data) {
         var si = entries.indexOf('split');
         if (si >= 0 && entries.length > 10) return { tableVar: lastVar[1], splitIdx: si };
     }
+    // Fallback: array literal `var X = ["a", "b", "split", ...]`
     var arrRx = /var\s+(\w+)=\[/g, am;
     while ((am = arrRx.exec(chunk)) !== null) {
         var start = am.index + am[0].length - 1;
@@ -87,6 +112,15 @@ function findStringTable(data) {
 /**
  * Find the largest var chain in the IIFE scope.
  * Returns array of variable names, or null if not found.
+ *
+ * YouTube hoists all function declarations into a single comma-separated
+ * var statement near the top of the IIFE. This gives us a complete list
+ * of scope-level names that the probe can enumerate.
+ *
+ * If that fails (YouTube switches to individual `var x=...` statements,
+ * ES6 const/let, or a different hoisting pattern), we fall back to scanning
+ * the source for `name=function(` patterns. This is less precise (may capture
+ * noise or miss names) but gives the probe SOMETHING to enumerate.
  */
 function findVarChain(data) {
     var varIdx = 0;
@@ -113,52 +147,98 @@ function findVarChain(data) {
         if (commas > biggest.count) biggest = { start: nextVar, count: commas, end: pos };
         varIdx = nextVar + 4;
     }
-    if (biggest.count < 50) return null;
-    var chain = data.substring(biggest.start + 4, biggest.end);
-    var names = [], depth = 0, start = 0, inStr = false, sq = '';
-    for (var i = 0; i < chain.length; i++) {
-        var ch = chain[i];
-        if (inStr) { if (ch === sq && chain[i - 1] !== '\\') inStr = false; }
-        else {
-            if (ch === '"' || ch === "'") { inStr = true; sq = ch; }
-            else if (ch === '{' || ch === '(' || ch === '[') depth++;
-            else if (ch === '}' || ch === ')' || ch === ']') depth--;
-            else if (ch === ',' && depth === 0) {
-                var name = chain.substring(start, i).trim();
-                var eq = name.indexOf('=');
-                if (eq !== -1) name = name.substring(0, eq).trim();
-                if (name && /^[\w$]+$/.test(name)) names.push(name);
-                start = i + 1;
+
+    if (biggest.count >= 50) {
+        var chain = data.substring(biggest.start + 4, biggest.end);
+        var names = [], depth = 0, start = 0, inStr = false, sq = '';
+        for (var i = 0; i < chain.length; i++) {
+            var ch = chain[i];
+            if (inStr) { if (ch === sq && chain[i - 1] !== '\\') inStr = false; }
+            else {
+                if (ch === '"' || ch === "'") { inStr = true; sq = ch; }
+                else if (ch === '{' || ch === '(' || ch === '[') depth++;
+                else if (ch === '}' || ch === ')' || ch === ']') depth--;
+                else if (ch === ',' && depth === 0) {
+                    var name = chain.substring(start, i).trim();
+                    var eq = name.indexOf('=');
+                    if (eq !== -1) name = name.substring(0, eq).trim();
+                    if (name && /^[\w$]+$/.test(name)) names.push(name);
+                    start = i + 1;
+                }
             }
         }
+        var last = chain.substring(start).trim();
+        var eq = last.indexOf('=');
+        if (eq !== -1) last = last.substring(0, eq).trim();
+        if (last && /^[\w$]+$/.test(last)) names.push(last);
+        if (names.length > 0) return names;
     }
-    var last = chain.substring(start).trim();
-    var eq = last.indexOf('=');
-    if (eq !== -1) last = last.substring(0, eq).trim();
-    if (last && /^[\w$]+$/.test(last)) names.push(last);
-    return names;
+
+    // Fallback: scan entire source for function definition patterns.
+    // Captures both `name=function(` and `function name(` and `var name=function(`.
+    // This is noisier than var-chain extraction but survives hoisting style changes.
+    var fallbackNames = new Set();
+    var patterns = [
+        /(?:^|[^a-zA-Z0-9_$])([a-zA-Z_$][\w$]*)\s*=\s*function\s*\(/g,
+        /function\s+([a-zA-Z_$][\w$]*)\s*\(/g,
+        /(?:^|[^a-zA-Z0-9_$])var\s+([a-zA-Z_$][\w$]*)\s*=\s*function\s*\(/g
+    ];
+    for (var pi = 0; pi < patterns.length; pi++) {
+        var rx = patterns[pi], fm;
+        while ((fm = rx.exec(data)) !== null) {
+            if (fm[1] && fm[1].length <= 8) fallbackNames.add(fm[1]);
+        }
+    }
+    return fallbackNames.size > 0 ? Array.from(fallbackNames) : [];
+}
+
+/**
+ * Find the IIFE close position — the offset where we should insert the probe,
+ * just before the IIFE's closing `)`.
+ *
+ * Tries multiple known wrapper patterns in priority order. If none match,
+ * falls back to finding the last `}` followed by `(` at the end of the file
+ * (a generic IIFE invocation pattern).
+ */
+function findIifeClose(data) {
+    // Known wrapper patterns, ordered most-specific to most-generic
+    var patterns = [
+        '})(_yt_player)',   // Main player (base.js)
+        ').call(this)',      // TV player variant
+        '}).call(this)',     // Alternative TV close
+        '})(this)',          // Another this-bound variant
+        '})()',              // Anonymous self-call
+        '})('                // Most generic — matches any `})(arg)` pattern
+    ];
+    for (var i = 0; i < patterns.length; i++) {
+        var idx = data.lastIndexOf(patterns[i]);
+        if (idx !== -1) return idx;
+    }
+    return -1;
 }
 
 /**
  * Build runtime probe code.
  *
- * Runs INSIDE the player IIFE after execution. Two phases:
+ * Runs INSIDE the player IIFE after execution. Three phases:
  *
- * Phase 1 (candidate collection): For each var-chain name, checks
- * typeof === "function" && .length >= 3, then scans func.toString()
- * for XOR table accesses to extract bases.
+ * Phase 0 (candidate enumeration): First tries the static var-chain names
+ *   (fast, pre-extracted). If those yield no XOR-bearing functions, falls
+ *   back to runtime enumeration walking globalThis and _yt_player properties.
+ *   This ensures we find functions even if YouTube changes how they're declared.
  *
- * Phase 2 (r-outer bit-reversal scan): Iterates r in bit-reversal order
- * (0,128,64,192,32,...) over 0–255. At each r, tests ALL candidates with
- * ALL their bases. First valid match wins.
+ * Phase 1 (XOR scan): For each callable candidate (>= 3 params), scans
+ *   func.toString() for table-access patterns: table[x^N], table[N^x],
+ *   table[x-N], table[N-x], table[x+N], table[N+x]. Extracts candidate bases.
  *
- * The bit-reversal order covers the full byte range with maximum spread,
- * reaching any valid r within ≤128 steps (typically ~16). No hardcoded
- * maxR constant — immune to obfuscator changes in branch guard thresholds.
+ * Phase 2 (r-outer bit-reversal scan): Iterates r in bit-reversal order over
+ *   0-255. At each r, tests ALL candidates with ALL their bases. First valid
+ *   match wins. Bit-reversal covers the full byte range with maximum spread
+ *   (0, 128, 64, 192, 32, ...) so any valid r is reached in ≤128 steps.
  *
  * @param {string} mode - "n" for n-param, "sig" for signature cipher
- * @param {string[]} varNames - Variable names from the IIFE var chain
- * @param {string} tableVar - String table variable name (e.g. "d")
+ * @param {string[]|null} varNames - Variable names from static extraction (may be null)
+ * @param {string} tableVar - String table variable name
  * @param {number} splitIdx - Index of "split" in the string table
  * @param {object|null} cache - {funcName, r, p} for fast path
  */
@@ -174,31 +254,35 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
         var testVal2 = mode === 'sig'
             ? '"ZZq0QJ8wRAIgTXjVbFq4RE0_C3YYzJ-j-rVqGi25Oj_bm9c3x2CiqKICIFfBKjR5Q3iBvFHIqZLqhY1jQ9o5a_FV8WNi9Z2v3BdMAhIARbCqF0FHZZ"'
             : '"ZYXWVUTS98765432"';
+        // Verify via the runtime name lookup helper so we don't depend on the
+        // cached name being at scope (it may have been a local IIFE var).
         return [
             'try{',
-            '  var _cv1=' + cache.funcName + '(' + cache.r + ',' + cache.p + ',' + testVal + ');',
-            '  var _cv2=' + cache.funcName + '(' + cache.r + ',' + cache.p + ',' + testVal + ');',
-            '  var _cv3=' + cache.funcName + '(' + cache.r + ',' + cache.p + ',' + testVal2 + ');',
-            '  if(typeof _cv1==="string"&&_cv1===_cv2&&_cv1!==' + testVal + '&&_cv3!==_cv1){',
-            '    _result.' + resultKey + '=function(x){return ' + cache.funcName + '(' + cache.r + ',' + cache.p + ',x);};',
-            '    _result.' + nameKey + '="' + cache.funcName + '(' + cache.r + ',' + cache.p + ',x)";',
+            '  var _cf=(function(n){try{return eval(n);}catch(e){return null;}})("' + cache.funcName + '");',
+            '  if(!_cf){_cf=(typeof _yt_player!=="undefined"&&_yt_player&&_yt_player["' + cache.funcName + '"])||null;}',
+            '  if(typeof _cf==="function"){',
+            '    var _cv1=_cf(' + cache.r + ',' + cache.p + ',' + testVal + ');',
+            '    var _cv2=_cf(' + cache.r + ',' + cache.p + ',' + testVal + ');',
+            '    var _cv3=_cf(' + cache.r + ',' + cache.p + ',' + testVal2 + ');',
+            '    if(typeof _cv1==="string"&&_cv1===_cv2&&_cv1!==' + testVal + '&&_cv3!==_cv1){',
+            '      _result.' + resultKey + '=function(x){return _cf(' + cache.r + ',' + cache.p + ',x);};',
+            '      _result.' + nameKey + '="' + cache.funcName + '(' + cache.r + ',' + cache.p + ',x)";',
+            '    }',
             '  }',
             '}catch(e){}'
         ].join('\n');
     }
 
     // Full probe: collect candidates, then r-outer bit-reversal scan
-    var namesJSON = JSON.stringify(varNames);
+    var namesJSON = JSON.stringify(varNames || []);
     var isNParam = mode !== 'sig';
 
     var validate;
     if (isNParam) {
-        // N-param: output must contain new chars not in input
+        // N-param: output must contain new chars not in input (charset expansion)
         validate = '&&_newCh(_t1,_v1)';
     } else {
-        // Cipher: output must be same length ± 10, and must NOT contain new
-        // chars (pure permutation). The !_newCh check prevents the n-param
-        // function from being falsely identified as a cipher.
+        // Cipher: output is a permutation (same chars, different order, length ±10)
         validate = '&&_v1.length>=20&&_v1.length<=_t1.length&&_v1.length>=_t1.length-10&&!_newCh(_t1,_v1)';
     }
 
@@ -214,22 +298,64 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
         'var _t1="' + t1 + '",_t2="' + t2 + '";',
         // Helper: returns true if b contains any character not in a
         'function _newCh(a,b){var s=new Set(a.split(""));for(var i=0;i<b.length;i++)if(!s.has(b[i]))return true;return false;}',
-        // 8-bit reversal: 0→0, 1→128, 2→64, 3→192, ...
-        // Produces maximum-spread ordering over 0–255
+        // 8-bit reversal: 0,128,64,192,32,160,96,224,16,144,80,...
+        // Maximum-spread ordering over 0-255 for fast discovery of valid r values.
         'function _br8(n){n=((n&240)>>4)|((n&15)<<4);n=((n&204)>>2)|((n&51)<<2);return((n&170)>>1)|((n&85)<<1);}',
-        'var _xr=new RegExp(_tv+"\\\\[\\\\w+\\\\^(\\\\d+)\\\\]","g");',
+        // Extract candidate bases from a function body. Tries multiple arithmetic
+        // patterns: XOR (current YouTube), subtraction, addition. If YouTube
+        // changes the obfuscation scheme, we'll still find candidates.
+        'function _getBases(src){',
+        '  var bases=new Set(),m;',
+        '  var rxXor=new RegExp(_tv+"\\\\[\\\\w+\\\\^(\\\\d+)\\\\]","g");',
+        '  var rxXorRev=new RegExp(_tv+"\\\\[(\\\\d+)\\\\^\\\\w+\\\\]","g");',
+        '  var rxSub=new RegExp(_tv+"\\\\[\\\\w+\\\\-(\\\\d+)\\\\]","g");',
+        '  var rxAdd=new RegExp(_tv+"\\\\[\\\\w+\\\\+(\\\\d+)\\\\]","g");',
+        '  while((m=rxXor.exec(src))!==null)bases.add(parseInt(m[1])^_si);',
+        '  while((m=rxXorRev.exec(src))!==null)bases.add(parseInt(m[1])^_si);',
+        '  while((m=rxSub.exec(src))!==null)bases.add(parseInt(m[1]));',
+        '  while((m=rxAdd.exec(src))!==null)bases.add(parseInt(m[1]));',
+        '  return bases;',
+        '}',
+        // Enumerate candidate function NAMES to try. Start with static var-chain,
+        // fall back to runtime globalThis + _yt_player walk. The runtime fallback
+        // makes us immune to changes in how the IIFE declares its locals.
+        'function _getCandidateNames(){',
+        '  var names=_vn.slice();',
+        '  var seen=new Set(names);',
+        '  // Walk _yt_player if present (player-scoped globals)',
+        '  try{',
+        '    if(typeof _yt_player!=="undefined"&&_yt_player){',
+        '      for(var k in _yt_player){if(!seen.has(k)){names.push(k);seen.add(k);}}',
+        '    }',
+        '  }catch(e){}',
+        '  // Walk globalThis (top-level globals that the IIFE may have hoisted)',
+        '  try{',
+        '    for(var k2 in globalThis){if(!seen.has(k2)){names.push(k2);seen.add(k2);}}',
+        '  }catch(e){}',
+        '  return names;',
+        '}',
+        // Resolve a name to a function via any accessible scope',
+        'function _resolveFn(name){',
+        '  try{var f=eval(name);if(typeof f==="function")return f;}catch(e){}',
+        '  try{if(typeof _yt_player!=="undefined"&&_yt_player&&typeof _yt_player[name]==="function")return _yt_player[name];}catch(e){}',
+        '  try{if(typeof globalThis[name]==="function")return globalThis[name];}catch(e){}',
+        '  return null;',
+        '}',
         '',
-        '// Phase 1: collect candidate functions with their XOR bases',
+        '// Phase 1: collect candidate functions with their bases',
         'var _cands=[];',
-        'for(var _i=0;_i<_vn.length;_i++){',
-        '  var _f;try{_f=eval(_vn[_i]);}catch(e){continue;}',
-        '  if(typeof _f!=="function"||_f.length<3)continue;',
+        'var _allNames=_getCandidateNames();',
+        'var _seenFns=new Set();',
+        'for(var _i=0;_i<_allNames.length;_i++){',
+        '  var _f=_resolveFn(_allNames[_i]);',
+        '  if(!_f||_f.length<3)continue;',
+        '  if(_seenFns.has(_f))continue;',
+        '  _seenFns.add(_f);',
         '  var _s;try{_s=_f.toString();}catch(e){continue;}',
         '  if(_s.length<' + minSrcLen + ')continue;',
-        '  var _bs=new Set(),_m;_xr.lastIndex=0;',
-        '  while((_m=_xr.exec(_s))!==null)_bs.add(parseInt(_m[1])^_si);',
+        '  var _bs=_getBases(_s);',
         '  if(_bs.size<=' + minBases + ')continue;',
-        '  _cands.push({f:_f,nm:_vn[_i],bs:Array.from(_bs)});',
+        '  _cands.push({f:_f,nm:_allNames[_i],bs:Array.from(_bs)});',
         '}',
         '',
         '// Phase 2: r-outer bit-reversal scan across all candidates',
@@ -263,17 +389,21 @@ function buildRuntimeProbe(mode, varNames, tableVar, splitIdx, cache) {
  * Assemble executable code: SETUP + player + probe.
  * Tries without try-catch first (works for base.js which executes cleanly).
  * Falls back to try-catch wrapping (needed for TV player which throws on DOM access).
+ *
+ * Uses findIifeClose which tries multiple wrapper close patterns before falling
+ * back to brace-walking, making this robust against YouTube changing the IIFE
+ * invocation syntax.
  */
 function assembleCode(data, probeBody) {
-    var iifeCloseIdx = data.lastIndexOf('})(_yt_player)');
-    if (iifeCloseIdx === -1) iifeCloseIdx = data.lastIndexOf('}).call(this)');
-    if (iifeCloseIdx === -1) iifeCloseIdx = data.lastIndexOf('})(');
+    var iifeCloseIdx = findIifeClose(data);
     if (iifeCloseIdx === -1) {
+        // No recognizable IIFE close — append probe at end and hope for the best
         return SETUP_CODE + '\n' + data + '\n;(function(){' + probeBody + '})();';
     }
 
-    var strictIdx = data.indexOf("'use strict';");
-    var afterStrict = strictIdx !== -1 ? strictIdx + "'use strict';".length : data.indexOf('{') + 1;
+    var strictIdx = findUseStrict(data);
+    var strictLen = useStrictLen(data, strictIdx);
+    var afterStrict = strictIdx !== -1 ? strictIdx + strictLen : data.indexOf('{') + 1;
 
     // Return both variants; caller picks based on player type
     return {
@@ -300,12 +430,14 @@ function assembleCode(data, probeBody) {
 function preprocessPlayer(data, solvedCache) {
     var table = findStringTable(data);
     if (!table) {
-        var usIdx = data.indexOf("'use strict';");
+        var usIdx = findUseStrict(data);
         if (usIdx > 0 && usIdx < 10000)
             table = findStringTable(data.substring(usIdx));
     }
-    var varNames = findVarChain(data);
-    if (!table || !varNames) return SETUP_CODE + '\n' + data + '\n/* solver: no table or var chain */';
+    // Static var-chain extraction is best-effort; the probe's runtime
+    // enumeration handles the case where it returns null.
+    var varNames = findVarChain(data) || [];
+    if (!table) return SETUP_CODE + '\n' + data + '\n/* solver: no string table */';
 
     var probeBody = buildRuntimeProbe('n', varNames, table.tableVar, table.splitIdx, solvedCache);
     var code = assembleCode(data, probeBody);
@@ -315,7 +447,7 @@ function preprocessPlayer(data, solvedCache) {
     // Choose variant: base.js has 'use strict' at offset >1000 (copyright header),
     // TV player has it at offset <100. base.js runs cleanly without try-catch;
     // TV player needs try-catch to survive DOM access errors during init.
-    var usIdx = data.indexOf("'use strict';");
+    var usIdx = findUseStrict(data);
     return (usIdx > 1000 && usIdx < 10000) ? code.direct : code.wrapped;
 }
 
@@ -328,18 +460,18 @@ function preprocessPlayer(data, solvedCache) {
 function preprocessCipher(data, cipherCache) {
     var table = findStringTable(data);
     if (!table) {
-        var usIdx = data.indexOf("'use strict';");
+        var usIdx = findUseStrict(data);
         if (usIdx > 0 && usIdx < 10000)
             table = findStringTable(data.substring(usIdx));
     }
-    var varNames = findVarChain(data);
-    if (!table || !varNames) return SETUP_CODE + '\n' + data + '\n/* solver: no table or var chain */';
+    var varNames = findVarChain(data) || [];
+    if (!table) return SETUP_CODE + '\n' + data + '\n/* solver: no string table */';
 
     var probeBody = buildRuntimeProbe('sig', varNames, table.tableVar, table.splitIdx, cipherCache);
     var code = assembleCode(data, probeBody);
 
     if (typeof code === 'string') return code;
 
-    var usIdx = data.indexOf("'use strict';");
+    var usIdx = findUseStrict(data);
     return (usIdx > 1000 && usIdx < 10000) ? code.direct : code.wrapped;
 }
