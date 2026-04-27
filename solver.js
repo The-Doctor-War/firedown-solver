@@ -1,6 +1,5 @@
-
 // =============================================================================
-// YouTube N-Parameter Solver — Remote Module v12
+// YouTube N-Parameter Solver — Remote Module v13
 // Hosted at: https://github.com/solarizeddev/firedown-solver
 //
 // Design principle: minimize structural assumptions about the player source.
@@ -14,45 +13,26 @@
 // v11: Runtime candidate enumeration, brace-walk IIFE detection, dual-quote
 //      'use strict', arithmetic-agnostic base scan.
 // v12: N-param architecture changed in player 1bb6ee63 (Apr 2026) — the
-//      standalone `f(r, p, x)` n-transform is gone. The transform now lives
-//      inside the URL parser class (historically `g.t_`). `TP(40, 1409, x)`
-//      and similar multi-dispatch helpers pass the old XOR probe's shape
-//      checks but return `"undefined" + x` when called with only 3 args,
-//      producing garbage transforms that make videoplayback reject the URL.
+//      standalone `f(r, p, x)` n-transform is gone. URL-class discovery as
+//      primary strategy. Call-site literal extraction for cipher.
+// v13: Stop the player from registering callbacks on the host's real event
+//      loop. Previously SETUP_CODE used `if (typeof globalThis.setTimeout
+//      === "undefined")` guards on its timer mocks. In Gecko's extension
+//      sandbox setTimeout already exists, so the guards skipped installation
+//      and the real timers were used. The player's IIFE registered callbacks
+//      that fired AFTER our probe finished, generating code via new Function
+//      / eval that referenced identifiers not present in our mocked env —
+//      producing a SyntaxError every ~4ms, forever, in the host console.
 //
-//      Three changes:
+//      Fix: install no-op timer mocks unconditionally. The player can't
+//      schedule anything, so no residual callbacks survive the probe.
 //
-//      1. PRIMARY STRATEGY FOR N-PARAM — URL-class discovery. After the
-//         player IIFE finishes initializing, walk runtime objects
-//         (_yt_player, globalThis, nested namespaces up to depth 2) looking
-//         for a 2-arg constructor whose instance has a `.get("n")` method
-//         that deterministically transforms our test input into a valid-
-//         looking n-value. No source pattern matching — pure behavioral
-//         detection. Works regardless of what YouTube names the class
-//         (g.t_, g.xY, _yt_player.Zz, whatever).
-//
-//      2. CALL-SITE EXTRACTION FOR XOR DISPATCHERS — the cipher function on
-//         this player is `kp(1, 7337, s)` (equivalently kp(10, 7330, s) —
-//         same T = V^Y). Previous probes tried to derive Y from XOR constants
-//         in the function body, but with Y never appearing inside kp's body
-//         (only T does) that derivation is impossible. Instead, we scan the
-//         player source once for `NAME(INT, INT, ...)` literal call sites
-//         and test each pair. 21 distinct names × a handful of pairs each,
-//         ~25ms scan. Replaces the 256×N-candidate bit-reversal for the
-//         common case.
-//
-//      3. XOR-PROBE VALIDATION HARDENING — both strategies above share new
-//         validators that would have rejected the `TP` false positive:
-//           a) input must not appear as a substring of output
-//           b) output must not start with "undefined", "null", "NaN",
-//              "[object", or other stringified-junk markers
-//           c) cipher test inputs are now fully distinct (v11 shared the
-//              middle and a cipher that scrambled the middle identically
-//              produced _v1 === _v3, failing the validator)
-//         Bit-reversal bit-scan remains as a fallback for older players
-//         where call sites aren't literal.
+//      Note: TypeError spam from URL-class probing (`y.U.call is not a
+//      function` etc.) is NOT addressed here — those are caught inside
+//      _testCtor but Gecko logs them anyway as a runtime behavior. Cannot
+//      be suppressed from JS. They're cosmetic; the solver still works.
 // =============================================================================
-var SOLVER_VERSION = 12;
+var SOLVER_VERSION = 13;
 
 var SETUP_CODE = [
     'if(typeof globalThis.XMLHttpRequest==="undefined"){globalThis.XMLHttpRequest={prototype:{}};}',
@@ -66,11 +46,21 @@ var SETUP_CODE = [
     'if(typeof globalThis.self==="undefined"){globalThis.self=globalThis;}',
     'if(typeof globalThis.addEventListener==="undefined"){globalThis.addEventListener=function(){};}',
     'if(typeof globalThis.removeEventListener==="undefined"){globalThis.removeEventListener=function(){};}',
-    'if(typeof globalThis.setTimeout==="undefined"){globalThis.setTimeout=function(f){try{f();}catch(e){}};}',
-    'if(typeof globalThis.clearTimeout==="undefined"){globalThis.clearTimeout=function(){};}',
-    'if(typeof globalThis.setInterval==="undefined"){globalThis.setInterval=function(){return 0;};}',
-    'if(typeof globalThis.clearInterval==="undefined"){globalThis.clearInterval=function(){};}',
-    'if(typeof globalThis.requestAnimationFrame==="undefined"){globalThis.requestAnimationFrame=function(){};}',
+    // Timer mocks: UNCONDITIONAL replacement (no `typeof === "undefined"` guard).
+    // The host environment (Gecko extension sandbox) provides real timers, but
+    // we don't want them — any callback the player schedules during IIFE
+    // execution would fire on the host event loop AFTER our probe completes,
+    // generating console-spamming SyntaxErrors as the player tries to JIT code
+    // in our minimal mocked environment. Replacing with no-ops makes timer
+    // registrations silently disappear.
+    'globalThis.setTimeout=function(){return 0;};',
+    'globalThis.clearTimeout=function(){};',
+    'globalThis.setInterval=function(){return 0;};',
+    'globalThis.clearInterval=function(){};',
+    'globalThis.requestAnimationFrame=function(){return 0;};',
+    'globalThis.cancelAnimationFrame=function(){};',
+    // queueMicrotask also silently dropped — same rationale.
+    'globalThis.queueMicrotask=function(){};',
     'if(typeof globalThis.getComputedStyle==="undefined"){globalThis.getComputedStyle=function(){return{opacity:"1"};};}',
 ].join('\n');
 
